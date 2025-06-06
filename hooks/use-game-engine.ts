@@ -10,11 +10,19 @@ import type { RealtimeChannel } from "@supabase/supabase-js"
 export const useGameEngine = (playerName: string | null) => {
   const [currentPlayerId, setCurrentPlayerId] = useState<string | null>(null)
   const [players, setPlayers] = useState<Record<string, Player>>({})
-  const playerRef = useRef<Player | null>(null) // To access current player data in event handlers
+  const playerRef = useRef<Player | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
 
-  const initializePlayer = useCallback(() => {
-    if (!playerName) return
+  const initializePlayer = useCallback(async () => {
+    // Make it async to await insert
+    if (!playerName) {
+      console.log("initializePlayer: No player name, skipping.")
+      return
+    }
+    if (playerRef.current) {
+      console.log("initializePlayer: Player already initialized.", playerRef.current.id)
+      return
+    }
 
     const newPlayerId = uuidv4()
     const newPlayer: Player = {
@@ -25,36 +33,70 @@ export const useGameEngine = (playerName: string | null) => {
       y: Math.floor(LOGICAL_HEIGHT / 2),
     }
 
-    setCurrentPlayerId(newPlayerId)
-    playerRef.current = newPlayer
-    setPlayers((prev) => ({ ...prev, [newPlayerId]: newPlayer }))
+    console.log("initializePlayer: Attempting to create player:", newPlayer)
 
-    supabase
+    // Optimistically set local state
+    // setCurrentPlayerId(newPlayerId); // Defer this until successful insert for now to test
+    // playerRef.current = newPlayer;
+    // setPlayers((prev) => ({ ...prev, [newPlayerId]: newPlayer }));
+
+    const { data: insertedPlayer, error: insertError } = await supabase
       .from("players")
       .insert(newPlayer)
-      .then(({ error }) => {
-        if (error) console.error("Error creating player:", error)
-      })
+      .select() // Important: select the inserted data to confirm
+      .single() // Expecting a single record back
+
+    if (insertError || !insertedPlayer) {
+      console.error("Error creating player:", insertError)
+      // Handle failed insert - perhaps notify user or retry
+      // For now, we won't set the player if insert fails
+      return
+    }
+
+    console.log("initializePlayer: Player created successfully in DB:", insertedPlayer)
+    setCurrentPlayerId(insertedPlayer.id)
+    playerRef.current = insertedPlayer as Player
+    setPlayers((prev) => ({ ...prev, [insertedPlayer.id]: insertedPlayer as Player }))
   }, [playerName])
 
   useEffect(() => {
-    if (playerName && !currentPlayerId) {
+    if (playerName && !currentPlayerId && !playerRef.current) {
+      // Ensure it only runs once if player isn't set
+      console.log("useEffect: PlayerName available, initializing player.")
       initializePlayer()
     }
   }, [playerName, currentPlayerId, initializePlayer])
 
   const updatePlayerPosition = useCallback(async (newX: number, newY: number) => {
-    if (!playerRef.current) return
+    if (!playerRef.current || !playerRef.current.id) {
+      console.warn("updatePlayerPosition: No current player or player ID to update.")
+      return
+    }
 
-    const updatedPlayer = { ...playerRef.current, x: newX, y: newY }
-    playerRef.current = updatedPlayer // Optimistic update locally
-    setPlayers((prev) => ({ ...prev, [updatedPlayer.id]: updatedPlayer }))
+    const playerId = playerRef.current.id
+    const oldPlayerState = { ...playerRef.current } // For potential revert
 
-    const { error } = await supabase.from("players").update({ x: newX, y: newY }).match({ id: updatedPlayer.id })
+    // Optimistic update locally
+    const updatedPlayerLocally = { ...playerRef.current, x: newX, y: newY }
+    playerRef.current = updatedPlayerLocally
+    setPlayers((prev) => ({ ...prev, [playerId]: updatedPlayerLocally }))
+
+    console.log(`updatePlayerPosition: Attempting to update player ${playerId} to x:${newX}, y:${newY}`)
+    const { error } = await supabase.from("players").update({ x: newX, y: newY }).match({ id: playerId })
 
     if (error) {
-      console.error("Error updating player position:", error)
-      // Potentially revert optimistic update or handle error
+      console.error(`Error updating player ${playerId} position:`, {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      })
+      // Revert optimistic update if server update fails
+      playerRef.current = oldPlayerState
+      setPlayers((prev) => ({ ...prev, [playerId]: oldPlayerState }))
+      console.warn(`updatePlayerPosition: Reverted optimistic update for player ${playerId}`)
+    } else {
+      // console.log(`updatePlayerPosition: Successfully updated player ${playerId} in DB.`);
     }
   }, [])
 
@@ -97,16 +139,23 @@ export const useGameEngine = (playerName: string | null) => {
   }, [handleKeyDown])
 
   useEffect(() => {
+    console.log("useEffect (Subscription): Setting up DB listeners.")
     // Fetch initial players
     supabase
       .from("players")
       .select("*")
       .then(({ data, error }) => {
         if (error) {
-          console.error("Error fetching initial players:", error)
+          console.error("Error fetching initial players:", {
+            message: error.message,
+            details: error.details,
+            hint: error.hint,
+            code: error.code,
+          })
           return
         }
         if (data) {
+          console.log("Fetched initial players:", data)
           const initialPlayers = data.reduce(
             (acc, p) => {
               acc[p.id] = p as Player
@@ -114,23 +163,49 @@ export const useGameEngine = (playerName: string | null) => {
             },
             {} as Record<string, Player>,
           )
-          setPlayers((prev) => ({ ...prev, ...initialPlayers })) // Merge with current player if already set
+          // Merge carefully, especially if initializePlayer is now async
+          // and might not have set the current player yet.
+          setPlayers((prev) => {
+            const merged = { ...initialPlayers, ...prev } // Prioritize prev if current player was just added
+            if (playerRef.current && !merged[playerRef.current.id]) {
+              // Ensure current player is in if recently added
+              merged[playerRef.current.id] = playerRef.current
+            }
+            return merged
+          })
         }
       })
 
     const channel = supabase
       .channel("realtime-players")
       .on<Player>("postgres_changes", { event: "*", schema: "public", table: "players" }, (payload) => {
+        console.log("Realtime event received:", payload)
+        if (payload.new?.id && payload.new.id === playerRef.current?.id && payload.eventType === "UPDATE") {
+          // This is an echo of our own update, already handled optimistically.
+          // We might want to reconcile if server state differs significantly.
+          // For now, we can choose to ignore or ensure our local state matches payload.new.
+          // console.log("Realtime: Received echo of own update for player:", payload.new.id);
+          // To ensure consistency, overwrite with server's version:
+          // playerRef.current = payload.new as Player; // if we trust server more
+          // setPlayers((prev) => ({ ...prev, [payload.new.id as string]: payload.new as Player }));
+          return
+        }
+
         if (payload.eventType === "INSERT") {
-          setPlayers((prev) => ({ ...prev, [payload.new.id]: payload.new as Player }))
+          console.log("Realtime: Player INSERTED:", payload.new)
+          setPlayers((prev) => ({ ...prev, [payload.new.id as string]: payload.new as Player }))
         } else if (payload.eventType === "UPDATE") {
-          setPlayers((prev) => ({ ...prev, [payload.new.id]: payload.new as Player }))
+          console.log("Realtime: Player UPDATED:", payload.new)
+          setPlayers((prev) => ({ ...prev, [payload.new.id as string]: payload.new as Player }))
         } else if (payload.eventType === "DELETE") {
-          setPlayers((prev) => {
-            const newPlayers = { ...prev }
-            delete newPlayers[payload.old.id as string]
-            return newPlayers
-          })
+          console.log("Realtime: Player DELETED:", payload.old)
+          if (payload.old?.id) {
+            setPlayers((prev) => {
+              const newPlayers = { ...prev }
+              delete newPlayers[payload.old.id as string]
+              return newPlayers
+            })
+          }
         }
       })
       .subscribe((status, err) => {
@@ -138,45 +213,71 @@ export const useGameEngine = (playerName: string | null) => {
           console.log("Subscribed to players channel!")
         }
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-          console.error(`Channel error: ${status}`, err)
+          console.error(
+            `Channel error: ${status}`,
+            err
+              ? {
+                  message: (err as any).message,
+                  details: (err as any).details,
+                  hint: (err as any).hint,
+                  code: (err as any).code,
+                }
+              : "Unknown channel error",
+          )
         }
       })
     channelRef.current = channel
 
     return () => {
+      console.log("useEffect (Subscription): Cleaning up DB listeners.")
       if (channelRef.current) {
         supabase.removeChannel(channelRef.current)
         channelRef.current = null
+        console.log("Removed channel subscription.")
       }
     }
-  }, [])
+  }, []) // Removed playerRef from dependency array to avoid re-subscribing on playerRef changes.
 
-  // Player disconnect logic
+  // useEffect for player disconnect (handleBeforeUnload and unmount)
   useEffect(() => {
-    const localPlayerId = currentPlayerId // Capture for cleanup
+    const localPlayerId = playerRef.current?.id // Capture for cleanup based on ref
 
     const handleBeforeUnload = async () => {
-      if (localPlayerId) {
+      if (playerRef.current?.id) {
+        // Check ref directly
+        console.log(`handleBeforeUnload: Attempting to delete player ${playerRef.current.id}`)
         // This is best-effort. Supabase client might not complete request.
-        await supabase.from("players").delete().match({ id: localPlayerId })
+        await supabase.from("players").delete().match({ id: playerRef.current.id })
       }
     }
     window.addEventListener("beforeunload", handleBeforeUnload)
 
     return () => {
       window.removeEventListener("beforeunload", handleBeforeUnload)
-      if (localPlayerId) {
+      const idToDeleteOnUnmount = playerRef.current?.id // Get ID from ref at time of unmount
+      if (idToDeleteOnUnmount) {
+        console.log(`Unmount: Attempting to delete player ${idToDeleteOnUnmount}`)
         supabase
           .from("players")
           .delete()
-          .match({ id: localPlayerId })
+          .match({ id: idToDeleteOnUnmount })
           .then(({ error }) => {
-            if (error) console.error("Error removing player on unmount:", error)
-            else console.log(`Player ${localPlayerId} removed on unmount.`)
+            if (error) {
+              console.error(`Error removing player ${idToDeleteOnUnmount} on unmount:`, {
+                message: error.message,
+                details: error.details,
+                hint: error.hint,
+                code: error.code,
+              })
+            } else {
+              console.log(`Player ${idToDeleteOnUnmount} removed on unmount call initiated.`)
+            }
           })
+      } else {
+        console.log("Unmount: No current player ID to delete.")
       }
     }
-  }, [currentPlayerId])
+  }, []) // Run once on mount/unmount. Relies on playerRef.current for the ID.
 
   return { players, currentPlayerId }
 }
